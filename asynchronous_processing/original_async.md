@@ -202,6 +202,145 @@ fn main(){
 }
 ```
 
+```
+Start
+Yielded: Start -> Middle
+Middle
+Yielded: Middle -> End
+End
+```
+### Task
+```rust
+type BoxFuture = Box<dyn SimpleFuture<Output = &'static str> + Send>;
+struct Task{
+    future: Mutex<Option<Pin<BoxFuture>>>,
+    executor: Arc<ExecutorInner>,
+}
+
+impl Task{
+    //自分自身をExecutorのqueueにpushする
+    fn schedule(self: &Arc<Self>){
+        self.executor.queue.lock().unwrap().push_back(self.clone());
+    }
+
+    fn poll(self: Arc<Self>){
+        let mut fut_slot=self.future.lock().unwrap();
+        if let Some(mut fut)=fut_slot.take(){ //takeするとtask.futureの中身はNoneになる
+            let waker=create_waker(self.clone()); //WakerにはTaskのアドレスが埋め込まれている
+            let mut ctx=Context::from_waker(&waker); //Contextの中にWakerが入っている
+
+            let res=fut.as_mut().poll(&mut ctx); //pollを呼び出すときにContextを渡す
+            match res{
+                Poll::Ready(val)=>{
+                    
+                }
+                Poll::Pending=>{
+                    *fut_slot=Some(fut); //Noneになったtask.futureの中身を戻す
+                }
+           }
+        }
+    }
+}
+```
+このコードでは
+* `poll`されたタイミングで自分自身を`create_waker(self.clone())`でWakerに持たせる
+* `let mut ctx=Context::from_waker(&waker);`でContextがWakerをラップする
+* `let res=fut.as_mut().poll(&mut ctx);`によってFutureの`poll()`呼び出す
+* Futureの`wake_by_ref()`では自分自身をExecutorにpushし、再スケジューリングする
+
+
+### Executor
+```rust
+struct ExecutorInner{
+    queue: Mutex<VecDeque<Arc<Task>>>, //同じタスクを共有
+}
+
+//同じキューを共有
+struct Executor{
+    inner: Arc<ExecutorInner>,
+}
+
+impl Executor{
+    fn new()->Self{
+        Self {
+            inner: Arc::new(ExecutorInner {
+                queue: Mutex::new(VecDeque::new()),
+             })
+        }
+    }
+
+    fn spawn(&self, future: impl SimpleFuture<Output = &'static str> + Send + 'static) {
+        let task=Arc::new(Task {
+            future: Mutex::new(Some(Box::pin(future))),
+            executor: self.inner.clone(), //共通のExecutorの参照カウンタを+1
+         });
+        self.inner.queue.lock().unwrap().push_back(task);
+    }
+
+
+
+    fn run(&self){
+        loop{
+            let task_opt=self.inner.queue.lock().unwrap().pop_front();
+
+            if let Some(task)=task_opt{
+                task.poll();
+            }else{
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+       
+    }
+}
+```
+* スレッド間で共有したいqueueは`ExecutorInner`にあり、Mutexで保護されている
+* `ExecutorInner`は複数の場所から使われるから`Arc`で包む
+    - `Executor`をcloneした別スレッド
+    - Wakerから呼ばれるschedule
+    - Taskから呼ばれるschedule
+* `Executor`事態は`run`や`spawn`などの操作を提供する
+* `ExecutorInner`は実体、`Executor`はハンドル
+
+
+### Waker
+```rust
+fn create_waker(task: Arc<Task>) -> Waker{
+    // Wakerのクローンをつくる
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        let arc = Arc::from_raw(data as *const Task); //from_rawしたarcはdropすると参照カウントが-1になる
+        let arc_clone = arc.clone();
+        std::mem::forget(arc); //ドロップした後に参照カウンタを-1しない
+        RawWaker::new(data, &VTABLE)
+    }
+
+    // Taskを再スケジューリングしてWakerを消費する
+    unsafe fn wake(data: *const()){
+        let task=Arc::from_raw(data as *const Task);
+        task.schedule();
+    }
+
+    // Wakerは消費されない
+    unsafe fn wake_by_ref(data: *const()){
+        let task=Arc::from_raw(data as *const Task);
+        task.schedule();
+        std::mem::forget(task);
+    }
+
+    //参照カウントを1減らす
+    unsafe fn drop(data: *const()){
+        let _=Arc::from_raw(data as *const Task);
+    }
+
+    //clone,wake,wake_by_ref,dropがWakerに紐づく
+    static VTABLE: RawWakerVTable=RawWakerVTable::new(clone,wake,wake_by_ref,drop);
+
+    let ptr=Arc::into_raw(task) as *const(); //Arc<Task>を生ポインタ化
+    let raw=RawWaker::new(ptr,&VTABLE); //RawWakerを作成
+    unsafe {Waker::from_raw(raw)} //Waker::from_rawで安全なWakerに変換
+}
+``` 
+
+なぜWakerはContextにラップされるのか
 ```rust
 pub struct Context<'a>{
     waker: &'a Waker,
@@ -212,35 +351,42 @@ impl<'a> Context<'a>{
     }
 }
 ```
+今の段階ではWakerを直接`poll`に渡しても何も問題はない
+```rust
+fn poll(self: Pin<&mut Self>, waker: &Waker) -> Poll<Self::Output>;
 ```
-Start
-Yielded: Start -> Middle
-Middle
-Yielded: Middle -> End
-End
+ただ将来の拡張性を考える
+* スレッド情報
+* 優先度
+* Executorの識別子  
+  
+こういったの情報をFutureに渡したいとき`poll`のシグネチャを変える必要がある
+```rust
+fn poll(self: Pin<&mut Self>, waker: &Waker, extra_info: &ExtraInfo) -> ...
 ```
+大変
 
 
 
-Contextの中身にはWakerの参照が入っている。
+* Contextの中身にはWakerの参照が入っている。
 ```rust
 Task::poll
 let waker=create_waker(task.clone())
 ```
-でTaskのアドレスが埋め込まれているWakerを作る。
+* Taskのアドレスが埋め込まれているWakerを作る。
 ```rust
 let mut cx=Context::from_waker(&waker);
 ```
-でコンテキストを作る。コンテキストはTaskの参照が入っている。
+* コンテキストを作る。コンテキストはTaskの参照が入っている。
 ```rust
 future.poll(&mut cx);
 ```
-futureを`poll`するときにコンテキストを渡す。 
+* futureを`poll`するときにコンテキストを渡す。 
 `poll()`では
 ```rust
 cx.waker().wake_by_ref();
 ```
-でコンテキストからWakerを取り出し、`wake_by_ref`を呼ぶことでWakerに埋め込まれたタスクをExecutorにpushする。  
+* コンテキストからWakerを取り出し、`wake_by_ref`を呼ぶことでWakerに埋め込まれたタスクをExecutorにpushする。  
 
 ## コルーチンバージョン
 ```rust
@@ -347,6 +493,18 @@ struct Task {
     executor: Arc<Executor>,
 }
 ```
+
+## スレッド、ワーカスレッド、CPUコア
+* CPUコア: 物理的な演算装置
+    - 4コアCPUなら同時に4つの計算を並列して実行できる
+    - 1つのコアが動かせるのは1つのスレッドだけ（ただし同時マルチスレッディング（SMT）を使うと1コアで複数スレッドを動かすこともある。例：Intel Hyper-Threading）
+
+* スレッド: 処理の単位
+    - プログラムの中の軽量な実行単位
+    - スレッド同士はスタックを別々に持ち、ヒープ領域を共有する
+
+* ワーカスレッド: 複数のタスクを受け付けて実行するスレッド
+    - 常駐する。スレッドはアイドル状態 (やることがないときは待機する) で待機していて、タスクが着たら実行する
 
 
 * シングルスレッド × 1 コア
