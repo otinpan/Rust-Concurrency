@@ -1,14 +1,22 @@
+#![feature(coroutines, coroutine_trait)]
+#![feature(stmt_expr_attributes)]
+
 use {
     std::{
-        //ops::{Coroutine,CoroutineState},
-        future::Future,
+        ops::{Coroutine,CoroutineState},
+        thread,
         pin::Pin,
         sync::{Arc, Mutex},
-        task::{Context, Waker},
         thread::{sleep},
         time::Duration,
+        collections::{VecDeque},
+        task::{RawWaker,RawWakerVTable,Waker,Context},
     },
 };
+
+
+// Pin: 自己参照を持つ型をmoveから守る
+// Context: Wakerを渡すためのラッパー
 
 
 trait SimpleFuture{
@@ -24,6 +32,7 @@ enum Poll<T>{
 
 struct MyFuture{
     state: State,
+    pinned: Pin<Box<dyn Coroutine<Yield=State,Return=State>>>,
 }
 
 #[derive(Debug)]
@@ -35,9 +44,15 @@ enum State{
 
 impl MyFuture{
     fn new()->Self{
-        Self{
-            state:State::Start,
-        }
+        let coro=#[coroutine]||{
+            println!("Start");
+            yield State::Middle;
+            println!("Middle");
+            yield State::End;
+            println!("End");
+            return State::End;
+        };
+        Self{state: State::Start,pinned: Box::pin(coro)}       
     }
 }
 
@@ -45,24 +60,15 @@ impl SimpleFuture for MyFuture{
     type Output=&'static str;
     fn poll(mut self:Pin<&mut Self>)->Poll<Self::Output>{
         let this=self.as_mut().get_mut();
-        match this.state{
-            State::Start=>{
-                println!("Start");
-                println!("Yielded: Start -> Middle");
-                this.state=State::Middle;
+        match this.pinned.as_mut().resume(()){
+            CoroutineState::Yielded(val)=>{
+                println!("Yielded: {:?}->{:?}",self.state,val);
+                self.state=val;
                 Poll::Pending
             }
-            State::Middle=>{
-                println!("Middle");
-                println!("Yielded: Middle -> End");
-                this.state=State::End;
-                Poll::Pending
-            }
-            State::End=>{
-                println!("End");
+            CoroutineState::Complete(val)=>{
                 Poll::Ready("finished")
             }
-
         }
     }
 }
@@ -88,4 +94,3 @@ fn main(){
         sleep(Duration::from_secs(2));
     }
 }
-
