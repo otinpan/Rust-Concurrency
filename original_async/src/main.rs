@@ -184,6 +184,7 @@ fn create_waker(task: Arc<Task>) -> Waker{
     unsafe {Waker::from_raw(raw)} //Waker::from_rawで安全なWakerに変換
 }
 
+
 // main ///////////////////////////////////////////////////////////////////////////////////////////////////
 fn main(){
     let executor=Executor::new();
